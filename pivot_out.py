@@ -22,7 +22,9 @@ Standard library only, so there's nothing to pip install.
 import argparse
 import csv
 import json
+import ipaddress
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -54,6 +56,38 @@ def clean_domain(name):
     if name.startswith("*."):
         name = name[2:]
     return name
+
+
+# A domain is labels of letters, digits, and hyphens (1-63 chars, no hyphen at either end),
+# separated by dots, ending in a real-looking TLD (letters, or xn-- for internationalized ones).
+LABEL = r"(?!-)[a-z0-9-]{1,63}(?<!-)"
+DOMAIN_RE = re.compile(rf"^(?:{LABEL}\.)+(?:[a-z]{{2,63}}|xn--[a-z0-9-]{{1,59}})$")
+
+
+def is_valid_domain(name):
+    """True only for things shaped like a domain.
+
+    This matters more than it looks: SANs come from certs and hostnames come from
+    passive DNS, and the ATTACKER controls both. Anything that isn't a clean domain
+    (spaces, slashes, quotes, weird characters) gets dropped before we build a URL with it.
+    """
+    return len(name) <= 253 and bool(DOMAIN_RE.match(name))
+
+
+def refang(value):
+    """Undo defanging so people can paste evil[.]com or hxxps://evil[.]com/path."""
+    value = value.strip().replace("[.]", ".").replace("(.)", ".").replace("[dot]", ".")
+    value = re.sub(r"^hxxp", "http", value, flags=re.IGNORECASE)
+    return value.split("//")[-1].split("/")[0].split(":")[0]
+
+
+def csv_safe(value):
+    """Stop spreadsheet formula injection: a cell starting with = + - @ can RUN in Excel.
+
+    Cert issuer names and hostnames are attacker-influenced, so we never trust them in a CSV.
+    """
+    text = "" if value is None else str(value)
+    return "'" + text if text[:1] in ("=", "+", "-", "@", "\t", "\r") else text
 
 
 def get_json(url, headers=None, tries=3):
@@ -200,6 +234,10 @@ def pivot(start, rounds, max_domains, vt_key):
                 for san in cert["sans"]:
                     if san == domain:
                         continue
+                    if not is_valid_domain(san):
+                        add("skipped", san[:100], f"crt.sh ID {cert['crtsh_id']}", "crt.sh", cert["not_before"],
+                            cert["query"], "not a valid domain, not pivoting on it")
+                        continue
                     add("san", san, f"crt.sh ID {cert['crtsh_id']}", "crt.sh", cert["not_before"], cert["query"], note)
                     # Don't loop through giant shared certs, that's how you end up pivoting into half the internet
                     if san not in seen and not note and len(seen) < max_domains:
@@ -232,7 +270,7 @@ def save(findings, start, out_dir):
     with open(base + ".csv", "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(safe[0].keys()) if safe else ["type"])
         writer.writeheader()
-        writer.writerows(safe)
+        writer.writerows({k: csv_safe(v) for k, v in row.items()} for row in safe)
     return base
 
 
@@ -244,7 +282,9 @@ def main():
     parser.add_argument("--out", default="output", help="folder for the JSON and CSV (default ./output)")
     args = parser.parse_args()
 
-    start = clean_domain(args.domain.replace("[.]", ".").split("//")[-1].split("/")[0])
+    start = clean_domain(refang(args.domain))
+    if not is_valid_domain(start):
+        parser.error(f"'{args.domain}' doesn't look like a domain. Try something like evil.example or evil[.]example")
     vt_key = os.environ.get("VT_API_KEY")
     if not vt_key:
         print("No VT_API_KEY set, skipping passive DNS. (Free key: virustotal.com, then Profile > API Key.)", file=sys.stderr)
