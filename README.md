@@ -78,3 +78,7 @@ The tests use fake data, so they don't hit any real service.
 ### Never commit your keys
 
 `.env` and `output/` are in `.gitignore`. If you ever DO push a key by accident, regenerate it right away in your VirusTotal profile. Deleting the commit isn't enough, bots scrape GitHub for keys within minutes.
+
+## License
+
+MIT, see [LICENSE](LICENSE). Use it, change it, learn from it, just keep the copyright line.
