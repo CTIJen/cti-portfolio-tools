@@ -6,7 +6,8 @@ Companion script for CTI Portfolio Part 3 on ctijen.com.
 Start from one domain and collect, PASSIVELY:
   1. registration data (RDAP)
   2. certificates and their SANs (crt.sh), looping through new SANs
-  3. passive DNS (VirusTotal, only if VT_API_KEY is set)
+  3. passive DNS (VirusTotal, only if VT_API_KEY is set), plus what else lived
+     on each IP around the same time, skipping shared networks like Cloudflare
 
 Nothing here ever touches the domain's own servers. Every request goes to
 a third party that already collected the data (a registry, crt.sh, VT).
@@ -34,6 +35,40 @@ from datetime import datetime, timezone
 
 USER_AGENT = "pivot-out/0.1 (CTI portfolio script; passive lookups only)"
 BIG_CERT = 50  # a cert with more SANs than this is probably shared hosting or a CDN
+BUSY_IP = 30  # an IP with this many domains on it is probably shared hosting, too busy to mean much
+
+# Cloudflare's published ranges (https://www.cloudflare.com/ips/, checked Nov 2026).
+# Millions of unrelated sites sit behind these, so two domains on a Cloudflare IP means NOTHING.
+SHARED_NETWORKS = {
+    "Cloudflare": [ipaddress.ip_network(n) for n in (
+        "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
+        "141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
+        "197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
+        "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+        "2400:cb00::/32", "2606:4700::/32", "2803:f800::/32", "2405:b500::/32",
+        "2405:8100::/32", "2a06:98c0::/29", "2c0f:f248::/32",
+    )],
+}
+
+
+def shared_network(ip):
+    """Return the provider name if this IP belongs to a big shared network, else None."""
+    try:
+        address = ipaddress.ip_address(ip)
+    except ValueError:
+        return None
+    for provider, networks in SHARED_NETWORKS.items():
+        if any(address.version == n.version and address in n for n in networks):
+            return provider
+    return None
+
+
+def days_apart(date_a, date_b):
+    """How many days between two YYYY-MM-DD dates (None if either is missing)."""
+    if not date_a or not date_b:
+        return None
+    fmt = "%Y-%m-%d"
+    return abs((datetime.strptime(date_a, fmt) - datetime.strptime(date_b, fmt)).days)
 
 
 def now_utc():
@@ -191,13 +226,33 @@ def lookup_resolutions(domain, api_key):
     return rows
 
 
+def lookup_ip_neighbors(ip, api_key):
+    """Every domain VirusTotal has seen pointing at this IP, with dates. "What else lived here?"."""
+    url = f"https://www.virustotal.com/api/v3/ip_addresses/{urllib.parse.quote(ip)}/resolutions?limit=40"
+    data = get_json(url, headers={"x-apikey": api_key})
+    time.sleep(16)
+    if not data:
+        return []
+    rows = []
+    for item in data.get("data", []):
+        attrs = item.get("attributes", {})
+        seen = attrs.get("date")
+        rows.append({
+            "host": clean_domain(attrs.get("host_name", "")),
+            "date": datetime.fromtimestamp(seen, timezone.utc).strftime("%Y-%m-%d") if seen else None,
+            "query": url.split("?")[0],
+        })
+    return rows
+
+
 # ---------- Putting it together ----------
 
-def pivot(start, rounds, max_domains, vt_key):
+def pivot(start, rounds, max_domains, vt_key, neighbors=True, window=7):
     findings = []  # one row per thing we learned, with where and when we learned it
     seen = {start}
     registered = set()  # domains we already pulled registration data for
     seen_certs = set()  # the same cert comes back for every domain on it, only record it once
+    checked_ips = set()  # two domains on one IP? only spend one VT lookup on it
     to_check = [start]
 
     def add(kind, value, related_to, source, date, query, note=""):
@@ -246,7 +301,28 @@ def pivot(start, rounds, max_domains, vt_key):
 
             if vt_key:
                 for res in lookup_resolutions(domain, vt_key):
-                    add("resolution", res["ip"], domain, "VirusTotal", res["date"], res["query"])
+                    provider = shared_network(res["ip"])
+                    note = f"{provider} IP, shared by tons of unrelated sites, not pivoting on it" if provider else ""
+                    add("resolution", res["ip"], domain, "VirusTotal", res["date"], res["query"], note)
+                    if not neighbors or provider or res["ip"] in checked_ips:
+                        continue
+                    checked_ips.add(res["ip"])
+
+                    # "What else lived on this IP?" Neighbors are LEADS, so we record them
+                    # but don't loop through them (that's how a pivot eats your whole week).
+                    found = lookup_ip_neighbors(res["ip"], vt_key)
+                    if len(found) >= BUSY_IP:
+                        add("busy_ip", res["ip"], domain, "VirusTotal", res["date"], found[0]["query"],
+                            f"{len(found)}+ domains on this IP, probably shared hosting, not listing them")
+                        continue
+                    for n in found:
+                        if n["host"] == domain or not is_valid_domain(n["host"]):
+                            continue
+                        gap = days_apart(n["date"], res["date"])
+                        when = "unknown timing" if gap is None else (
+                            f"SAME WEEK as {defang(domain)}" if gap <= window
+                            else f"{gap} days apart from {defang(domain)}")
+                        add("ip_neighbor", n["host"], res["ip"], "VirusTotal", n["date"], n["query"], when)
 
         to_check = next_round
         if not to_check:
@@ -280,6 +356,10 @@ def main():
     parser.add_argument("--rounds", type=int, default=1, help="how many times to loop through new SANs (default 1)")
     parser.add_argument("--max-domains", type=int, default=25, help="stop adding new domains after this many (default 25)")
     parser.add_argument("--out", default="output", help="folder for the JSON and CSV (default ./output)")
+    parser.add_argument("--skip-neighbors", action="store_true",
+                        help="don't ask VT what else lived on each IP (saves your free VT quota)")
+    parser.add_argument("--window", type=int, default=7,
+                        help="days apart that still count as 'same time' for IP neighbors (default 7)")
     args = parser.parse_args()
 
     start = clean_domain(refang(args.domain))
@@ -289,11 +369,14 @@ def main():
     if not vt_key:
         print("No VT_API_KEY set, skipping passive DNS. (Free key: virustotal.com, then Profile > API Key.)", file=sys.stderr)
 
-    findings = pivot(start, args.rounds, args.max_domains, vt_key)
+    findings = pivot(start, args.rounds, args.max_domains, vt_key,
+                     neighbors=not args.skip_neighbors, window=args.window)
     base = save(findings, start, args.out)
 
     domains = {f["value"] for f in findings if f["type"] == "san"}
-    print(f"\nDone! {len(findings)} findings, {len(domains)} unique SAN domains.")
+    close = {f["value"] for f in findings if f["type"] == "ip_neighbor" and f["note"].startswith("SAME WEEK")}
+    print(f"\nDone! {len(findings)} findings, {len(domains)} unique SAN domains, "
+          f"{len(close)} IP neighbors from the same week.")
     print(f"Saved {base}.json and {base}.csv")
     print("Reminder: these are LEADS. Check each one against your other evidence before it goes on the map.")
 
