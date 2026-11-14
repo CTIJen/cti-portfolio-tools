@@ -138,8 +138,9 @@ def get_json(url, headers=None, tries=3):
             if err.code == 404:
                 return None  # not found is an answer, not an error
             if err.code == 429:
-                print("    rate limited, waiting 60s...", file=sys.stderr)
-                time.sleep(60)
+                if attempt < tries:
+                    print("    rate limited, waiting 60s...", file=sys.stderr)
+                    time.sleep(60)
                 continue
             problem = f"HTTP {err.code}"
         except (OSError, json.JSONDecodeError) as err:  # OSError covers timeouts and connection errors
