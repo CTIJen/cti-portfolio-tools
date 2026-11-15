@@ -58,7 +58,7 @@ Real lesson from building this: half the work is knowing what NOT to pivot on.
 
 - **Cloudflare IPs** get recorded but never pivoted on. Millions of unrelated sites share them.
 - **Busy IPs** (30+ domains) get flagged as probably shared hosting instead of listing every neighbor.
-- **Giant certs** (50+ SANs) are probably a CDN or shared hosting, so their SANs don't get looped through.
+- **Giant certs** (more than 50 SANs) are probably a CDN or shared hosting, so their SANs don't get looped through.
 - **IP neighbors are leads**, not findings. They're recorded with how many days apart they were, but never looped through.
 - **Attacker-controlled data gets checked.** SANs and passive DNS hostnames come from the attacker, so anything that isn't a clean domain is dropped before it goes into a URL, and CSV cells are protected against spreadsheet formula injection.
 
